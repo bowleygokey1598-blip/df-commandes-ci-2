@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  qualite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4 # https://github.com/actions/checkout/releases
+
+      - name: Configurer Node.js
+        uses: actions/setup-node@v4 # https://github.com/actions/setup-node/releases
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Vérifier le lint
+        run: npm run lint -- --max-warnings=0
+
+      - name: Exécuter les tests
+        run: npm test
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer tout l'historique
+        uses: actions/checkout@v4 # https://github.com/actions/checkout/releases
+        with:
+          fetch-depth: 0
+
+      - name: Installer gitleaks 8.30.1
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+
+      - name: Rechercher les secrets
+        run: gitleaks git -v --no-banner --redact .
+
+  revue-ia:
+    runs-on: ubuntu-latest
+    needs: [qualite, secrets]
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Vérifier le secret Copilot
+        id: copilot_pat
+        run: |
+          if [ -z "$COPILOT_PAT" ]; then
+            echo "revue IA sautée"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
+
+      - name: Récupérer le dépôt
+        if: steps.copilot_pat.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurer Node.js
+        if: steps.copilot_pat.outputs.available == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Installer GitHub Copilot CLI
+        if: steps.copilot_pat.outputs.available == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Écrire le diff de la pull request
+        if: steps.copilot_pat.outputs.available == 'true'
+        run: git diff "$BASE_SHA...$HEAD_SHA" -- . ':(exclude)package-lock.json' > pr.diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      - name: Relire le diff avec Copilot
+        if: steps.copilot_pat.outputs.available == 'true'
+        run: copilot -p "Relis la pull request dont le diff est dans pr.diff, selon ta consigne." --agent relecteur-pr -s --no-ask-user --allow-all-tools --deny-tool=write --deny-tool=shell --max-ai-credits 30 > revue.md
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+      - name: Publier la revue sur la pull request
+        if: steps.copilot_pat.outputs.available == 'true'
+        run: gh pr comment "$PR_URL" --body-file revue.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
